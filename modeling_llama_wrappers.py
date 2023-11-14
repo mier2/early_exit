@@ -1,4 +1,4 @@
-from transformers.models.llama.modeling_llama import LlamaMLP, LlamaAttention, LlamaModel, LLAMA_INPUTS_DOCSTRING, LlamaDecoderLayer, LlamaRMSNorm, LlamaForCausalLM
+from transformers.models.llama.modeling_llama import LlamaMLP, LlamaAttention, LlamaModel, LLAMA_INPUTS_DOCSTRING, LlamaDecoderLayer, LlamaRMSNorm, LlamaForCausalLM, _CONFIG_FOR_DOC, LlamaPreTrainedModel, apply_rotary_pos_emb, repeat_kv
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.utils import(
     add_start_docstrings,
@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 logger = logging.get_logger(__name__)
 
@@ -160,7 +161,7 @@ class CustomLlamaAttention(LlamaAttention):
 
 class CustomLlamaModel(LlamaModel):
     def __init__(self, config: LlamaConfig):
-        super().__init__(config)
+        LlamaPreTrainedModel.__init__(self,config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
