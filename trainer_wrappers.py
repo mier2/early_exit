@@ -200,8 +200,10 @@ class CustomTrainer(Trainer):
         callbacks: Optional[List[TrainerCallback]] = None,
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+    #***[MODIFIED]****
         stride_size: int = 4,
         exiting_layer: int = 0
+    #***[END OF MODIFICATION]****
     ):
         if args is None:
             output_dir = "tmp_trainer"
@@ -220,6 +222,7 @@ class CustomTrainer(Trainer):
         self._memory_tracker = TrainerMemoryTracker(self.args.skip_memory_metrics)
         self._memory_tracker.start()
         self.total_iterations = self.args.max_steps
+        #***[MODIFIED]***
         base = model
         while hasattr(base, "model"):
             base = base.model
@@ -227,6 +230,7 @@ class CustomTrainer(Trainer):
         self.num_layers = len(self.base_model.layers)
         self.stride_size = stride_size
         self.exiting_layer =  exiting_layer
+        #***[END OF MODIFICATION] ***
 
         # set the correct log level depending on the node
         log_level = args.get_process_log_level()
@@ -235,6 +239,7 @@ class CustomTrainer(Trainer):
         # force device and distributed setup init explicitly
         args._setup_devices
 
+        #*** [MODIFIED] ***
         self.exiting_layer = exiting_layer
         exit_layer = []
         iteration = self.num_layers // self.stride_size
@@ -264,7 +269,7 @@ class CustomTrainer(Trainer):
             current_iteration = next_iteration
         
         self.iteration_queue = iteration_queue
-
+        #*** [END OF MODIFICATION] ***
         if model is None:
             if model_init is not None:
                 self.model_init = model_init
@@ -825,6 +830,7 @@ class CustomTrainer(Trainer):
 
                 step = -1
                 for step, inputs in enumerate(epoch_iterator):
+                    #*** [MODIFIED] ***
                     current_iteration = self.state.global_step
 
                     print(f"current iteration {current_iteration}")
@@ -850,6 +856,7 @@ class CustomTrainer(Trainer):
 
                             if (f'layers.{i}.' in name) and (param.dtype.is_floating_point or param.dtype.is_complex):
                                 param.requires_grad_(True)
+                    #*** [END OF MODIFICATION] ***
                     total_batched_samples += 1
                     if rng_to_sync:
                         self._load_rng_state(resume_from_checkpoint)
@@ -1036,6 +1043,7 @@ class CustomTrainer(Trainer):
         else:
             labels = None
         
+        #*** [MODIFIED]
         chosen_layer = self.exiting_layer
 
         
@@ -1070,7 +1078,7 @@ class CustomTrainer(Trainer):
         loss = loss_fct(shift_logits, shift_labels)
         
         
-
+        #*** [END OF MODIFICATION] ***
         return (loss, outputs) if return_outputs else loss
 
 Trainer.__init__ = CustomTrainer.__init__

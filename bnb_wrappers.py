@@ -13,8 +13,10 @@ from peft.tuners.lora.layer import LoraLayer
 
 class CustomLinear8bitLt(Linear8bitLt):
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+            #*** [MODIFIED] ***
             kwargs_copy = copy.deepcopy(kwargs)
             kwargs_copy.pop('adapter_activation', None)
+            #*** [END OF MODIFICATION] ***
             if self.disable_adapters:
                 if self.merged:
                     self.unmerge()
@@ -39,8 +41,10 @@ class CustomLinear8bitLt(Linear8bitLt):
                         if x.dtype != compute_dtype:
                             x = x.to(compute_dtype)
                     output = lora_B(lora_A(dropout(x)))
+                    #*** [MODIFIED] ***
                     if "adapter_activation" in kwargs:
                         output = output * kwargs["adapter_activation"]
+                    #*** [END OF MODIFICATION] ***
                     if requires_conversion:
                         output = output.to(expected_dtype)
                     output = output * scaling
