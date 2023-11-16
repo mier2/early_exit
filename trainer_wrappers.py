@@ -200,10 +200,8 @@ class CustomTrainer(Trainer):
         callbacks: Optional[List[TrainerCallback]] = None,
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
-    #***[MODIFIED]****
-        stride_size: int = 4,
+        stride_size: int = 8,
         exiting_layer: int = 0
-    #***[END OF MODIFICATION]****
     ):
         if args is None:
             output_dir = "tmp_trainer"
@@ -222,7 +220,6 @@ class CustomTrainer(Trainer):
         self._memory_tracker = TrainerMemoryTracker(self.args.skip_memory_metrics)
         self._memory_tracker.start()
         self.total_iterations = self.args.max_steps
-        #***[MODIFIED]***
         base = model
         while hasattr(base, "model"):
             base = base.model
@@ -230,7 +227,6 @@ class CustomTrainer(Trainer):
         self.num_layers = len(self.base_model.layers)
         self.stride_size = stride_size
         self.exiting_layer =  exiting_layer
-        #***[END OF MODIFICATION] ***
 
         # set the correct log level depending on the node
         log_level = args.get_process_log_level()
@@ -239,7 +235,6 @@ class CustomTrainer(Trainer):
         # force device and distributed setup init explicitly
         args._setup_devices
 
-        #*** [MODIFIED] ***
         self.exiting_layer = exiting_layer
         exit_layer = []
         iteration = self.num_layers // self.stride_size
@@ -269,7 +264,7 @@ class CustomTrainer(Trainer):
             current_iteration = next_iteration
         
         self.iteration_queue = iteration_queue
-        #*** [END OF MODIFICATION] ***
+
         if model is None:
             if model_init is not None:
                 self.model_init = model_init
@@ -730,11 +725,6 @@ class CustomTrainer(Trainer):
             epochs_trained = 0
             steps_trained_in_current_epoch = 0
             steps_trained_progress_bar = None
-            
-                        
-                        
-            
-            
 
             # Check if continuing training from a checkpoint
             if resume_from_checkpoint is not None and os.path.isfile(
@@ -830,21 +820,21 @@ class CustomTrainer(Trainer):
 
                 step = -1
                 for step, inputs in enumerate(epoch_iterator):
-                    #*** [MODIFIED] ***
                     current_iteration = self.state.global_step
 
-                    print(f"current iteration {current_iteration}")
-                    print(self.iteration_queue)
+                    # print(f"current iteration {current_iteration}")
+                    # print(self.iteration_queue)
                     if self.iteration_queue:
                         layer, (start, end) = self.iteration_queue[0]
                         if start <= current_iteration <= end:
                             self.exiting_layer = layer
+                            self.state.exiting_layer = layer
                         elif len(self.iteration_queue) > 1: 
                             self.iteration_queue.popleft()
                             self.exiting_layer = self.iteration_queue[0][0]
-                    print(f"current layer {self.exiting_layer}")
+                    # print(f"current layer {self.exiting_layer}")
                             
-
+            
                     for param in model.parameters():
                         param.requires_grad = False
 
@@ -856,7 +846,6 @@ class CustomTrainer(Trainer):
 
                             if (f'layers.{i}.' in name) and (param.dtype.is_floating_point or param.dtype.is_complex):
                                 param.requires_grad_(True)
-                    #*** [END OF MODIFICATION] ***
                     total_batched_samples += 1
                     if rng_to_sync:
                         self._load_rng_state(resume_from_checkpoint)
@@ -1043,7 +1032,6 @@ class CustomTrainer(Trainer):
         else:
             labels = None
         
-        #*** [MODIFIED]
         chosen_layer = self.exiting_layer
 
         
@@ -1056,6 +1044,7 @@ class CustomTrainer(Trainer):
         adapter_activation_tensor = torch.tensor(layer_list)
         
         inputs['adapter_activation'] = adapter_activation_tensor
+        inputs['model_status'] = "train"
         outputs = model(**inputs)
         labels = inputs['labels']
 
@@ -1078,9 +1067,126 @@ class CustomTrainer(Trainer):
         loss = loss_fct(shift_logits, shift_labels)
         
         
-        #*** [END OF MODIFICATION] ***
+
         return (loss, outputs) if return_outputs else loss
+    def prediction_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform an evaluation step on `model` using `inputs`.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to evaluate.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+            prediction_loss_only (`bool`):
+                Whether or not to return the loss only.
+            ignore_keys (`List[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+
+        Return:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss,
+            logits and labels (each being optional).
+        """
+        inputs['model_status'] = "eval"
+        inputs['adapter_activation'] = torch.ones(self.num_layers)
+        inputs['exit_layers'] = self.exiting_layer
+        inputs['output_hidden_states'] = True
+
+
+        has_labels = False if len(self.label_names) == 0 else all(inputs.get(k) is not None for k in self.label_names)
+        # For CLIP-like models capable of returning loss values.
+        # If `return_loss` is not specified or being `None` in `inputs`, we check if the default value of `return_loss`
+        # is `True` in `model.forward`.
+        return_loss = inputs.get("return_loss", None)
+        if return_loss is None:
+            return_loss = self.can_return_loss
+        loss_without_labels = True if len(self.label_names) == 0 and return_loss else False
+
+        inputs = self._prepare_inputs(inputs)
+        if ignore_keys is None:
+            if hasattr(self.model, "config"):
+                ignore_keys = getattr(self.model.config, "keys_to_ignore_at_inference", [])
+            else:
+                ignore_keys = []
+
+        # labels may be popped when computing the loss (label smoothing for instance) so we grab them first.
+        if has_labels or loss_without_labels:
+            labels = nested_detach(tuple(inputs.get(name) for name in self.label_names))
+            if len(labels) == 1:
+                labels = labels[0]
+        else:
+            labels = None
+
+        with torch.no_grad():
+            if is_sagemaker_mp_enabled():
+                raw_outputs = smp_forward_only(model, inputs)
+                if has_labels or loss_without_labels:
+                    if isinstance(raw_outputs, dict):
+                        loss_mb = raw_outputs["loss"]
+                        logits_mb = tuple(v for k, v in raw_outputs.items() if k not in ignore_keys + ["loss"])
+                    else:
+                        loss_mb = raw_outputs[0]
+                        logits_mb = raw_outputs[1:]
+
+                    loss = loss_mb.reduce_mean().detach().cpu()
+                    logits = smp_nested_concat(logits_mb)
+                else:
+                    loss = None
+                    if isinstance(raw_outputs, dict):
+                        logits_mb = tuple(v for k, v in raw_outputs.items() if k not in ignore_keys)
+                    else:
+                        logits_mb = raw_outputs
+                    logits = smp_nested_concat(logits_mb)
+            else:
+                if has_labels or loss_without_labels:
+                    with self.compute_loss_context_manager():
+                        loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                    loss = loss.mean().detach()
+
+                    if isinstance(outputs, dict):
+                        logits = tuple(v for k, v in outputs.items() if k not in ignore_keys + ["loss"])
+                    else:
+                        logits = outputs[1:]
+                else:
+                    loss = None
+                    with self.compute_loss_context_manager():
+                        outputs = model(**inputs)
+                    if isinstance(outputs, dict):
+                        logits = tuple(v for k, v in outputs.items() if k not in ignore_keys)
+                    else:
+                        logits = outputs
+                    # TODO: this needs to be fixed and made cleaner later.
+                    if self.args.past_index >= 0:
+                        self._past = outputs[self.args.past_index - 1]
+
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        logits = nested_detach(logits)
+        if len(logits) == 1:
+            logits = logits[0]
+        
+        hidden_states = (outputs["hidden_states"] if isinstance(outputs, dict) else None)
+
+        return (loss, logits, labels, hidden_states)
+    
+
+
 
 Trainer.__init__ = CustomTrainer.__init__
 Trainer._inner_training_loop = CustomTrainer._inner_training_loop
 Trainer.compute_loss = CustomTrainer.compute_loss
+Trainer.prediction_step = CustomTrainer.prediction_step
+

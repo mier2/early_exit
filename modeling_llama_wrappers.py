@@ -3,12 +3,11 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.utils import(
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
     logging,
     replace_return_docstrings,
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter, _prepare_4d_causal_attention_mask
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
 import math
 import warnings
@@ -23,7 +22,7 @@ logger = logging.get_logger(__name__)
 
 
 class CustomLlamaMLP(LlamaMLP):
-    def forward(self, x, **kwargs):
+    def forward(self, x, lora_hidden_states=None, **kwargs):
         if self.config.pretraining_tp > 1:
             slice = self.intermediate_size // self.config.pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
@@ -41,12 +40,19 @@ class CustomLlamaMLP(LlamaMLP):
             ]
             down_proj = sum(down_proj)
         else:
+            model_status = kwargs["model_status"]
             if "adapter_activation" in kwargs:
-                down_proj = self.down_proj(self.act_fn(self.gate_proj(x, **kwargs)) * self.up_proj(x, **kwargs), **kwargs)
+                if model_status == "eval":
+                    kwargs["lora_hidden_states"] = lora_hidden_states
+                    down_proj, lora_down_proj= self.down_proj(self.act_fn(self.gate_proj(x, **kwargs)) * self.up_proj(x, **kwargs), **kwargs)
+                    return down_proj, lora_down_proj
+                elif model_status == "train":
+                    down_proj = self.down_proj(self.act_fn(self.gate_proj(x, **kwargs)) * self.up_proj(x, **kwargs), **kwargs)
+                    return down_proj
             else:
                 down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+                return down_proj
 
-        return down_proj
 
 
 class CustomLlamaAttention(LlamaAttention):
@@ -58,6 +64,7 @@ class CustomLlamaAttention(LlamaAttention):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        lora_hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if "padding_mask" in kwargs:
@@ -85,10 +92,18 @@ class CustomLlamaAttention(LlamaAttention):
             value_states = torch.cat(value_states, dim=-1)
 
         else:
+            model_status = kwargs["model_status"]
             if "adapter_activation" in kwargs:
-                query_states = self.q_proj(hidden_states, **kwargs)
-                key_states = self.k_proj(hidden_states, **kwargs)
-                value_states = self.v_proj(hidden_states, **kwargs)
+                if model_status == "eval":
+                    kwargs["lora_hidden_states"] = lora_hidden_states
+                    query_states, lora_query_states = self.q_proj(hidden_states, **kwargs)
+                    key_states, lora_key_states = self.k_proj(hidden_states, **kwargs)
+                    value_states, lora_value_states = self.v_proj(hidden_states, **kwargs)
+                elif model_status == "train":
+                    kwargs.pop('exit_layers', None)
+                    query_states = self.q_proj(hidden_states, **kwargs)
+                    key_states = self.k_proj(hidden_states, **kwargs)
+                    value_states = self.v_proj(hidden_states, **kwargs)
             else:
                 query_states = self.q_proj(hidden_states)
                 key_states = self.k_proj(hidden_states)
@@ -98,23 +113,53 @@ class CustomLlamaAttention(LlamaAttention):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        # lora part
+        if model_status == "eval":
+            lora_query_states = lora_query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            lora_key_states = lora_key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            lora_value_states = lora_value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        # lora part
+        if model_status == "eval":
+            lora_cos, lora_sin = self.rotary_emb(lora_value_states, seq_len=kv_seq_len)
+
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        
+        # lora part
+        if model_status == "eval":
+            lora_query_states, lora_key_states = apply_rotary_pos_emb(lora_query_states, lora_key_states, lora_cos, lora_sin, position_ids)
 
         if past_key_value is not None:
+            print("************************past_key_value***********************")
             # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
+        
+        # lora part
+        if model_status == "eval":
+            lora_past_key_value = (lora_key_states, lora_value_states) if use_cache else None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        # lora part
+        if model_status == "eval":
+            lora_key_states = repeat_kv(lora_key_states, self.num_key_value_groups)
+            lora_value_states = repeat_kv(lora_value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        # lora part
+        if model_status == "eval":
+            lora_attn_weights = torch.matmul(lora_query_states, lora_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -128,10 +173,19 @@ class CustomLlamaAttention(LlamaAttention):
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights + attention_mask
+            # lora 
+            if model_status == "eval":
+                lora_attn_weights = lora_attn_weights + attention_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
+
+        # lora part 
+        if model_status == "eval":
+            lora_attn_weights = nn.functional.softmax(lora_attn_weights, dim=-1, dtype=torch.float32).to(lora_query_states.dtype)
+            lora_attn_output = torch.matmul(lora_attn_weights, lora_value_states)
+
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -141,23 +195,153 @@ class CustomLlamaAttention(LlamaAttention):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
 
+        # lora part
+        if model_status == "eval":
+            lora_attn_output = lora_attn_output.transpose(1, 2).contiguous()
+
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
+        # lora part
+        if model_status == "eval":
+            lora_attn_output = lora_attn_output.reshape(bsz, q_len, self.hidden_size)
+
         if self.config.pretraining_tp > 1:
+            print("*********************self.config.pretraining_tp*******************")
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
             if "adapter_activation" in kwargs:
-                attn_output = self.o_proj(attn_output, **kwargs)
+                if model_status == "eval":
+                    attn_output, lora_attn_output = self.o_proj(attn_output, **kwargs)
+                elif model_status == "train":
+                    attn_output = self.o_proj(attn_output, **kwargs)
             else:
                 attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
+            if model_status == "eval":
+                lora_attn_output = None
+        
+        if model_status == "eval":
+            return attn_output, attn_weights, past_key_value, lora_attn_output, lora_attn_weights, lora_past_key_value
+        elif model_status == "train":
+            return attn_output, attn_weights, past_key_value
 
-        return attn_output, attn_weights, past_key_value
+class CustomLlamaDecoderLayer(LlamaDecoderLayer):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        lora_hidden_states: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.FloatTensor`, *optional*):
+                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
+                query_sequence_length, key_sequence_length)` if default attention is used.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+            use_cache (`bool`, *optional*):
+                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
+                (see `past_key_values`).
+            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+        """
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+        
+        model_status = kwargs["model_status"]
+        if model_status == "train":
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
+            # Self Attention
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                **kwargs,
+            )
+
+            hidden_states = residual + hidden_states
+
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            # kwargs['model_status'] = "train"
+            hidden_states = self.mlp(hidden_states, **kwargs)
+            hidden_states = residual + hidden_states
+
+            outputs = (hidden_states,)
+
+            if output_attentions:
+                outputs += (self_attn_weights,)
+
+            if use_cache:
+                outputs += (present_key_value,)
+
+            return outputs
+        elif model_status == "eval":
+            residual = hidden_states
+            lora_residual = lora_hidden_states
+
+            hidden_states = self.input_layernorm(hidden_states)
+            lora_hidden_states = self.input_layernorm(lora_hidden_states)
+
+            # Self Attention
+            hidden_states, self_attn_weights, present_key_value, lora_hidden_states, lora_self_attn_weights, lora_present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                lora_hidden_states = lora_hidden_states,
+                **kwargs,
+            )
+
+            hidden_states = residual + hidden_states
+            lora_hidden_states = lora_residual + lora_hidden_states
+
+            # Fully Connected
+            residual = hidden_states
+            lora_residual = lora_hidden_states
+
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            lora_hidden_states = self.post_attention_layernorm(lora_hidden_states)
+
+            hidden_states, lora_hidden_states = self.mlp(hidden_states, lora_hidden_states = lora_hidden_states, **kwargs)
+
+            hidden_states = residual + hidden_states
+            lora_hidden_states = lora_residual + lora_hidden_states
+
+            outputs = (hidden_states,)
+            lora_outputs = (lora_hidden_states,)
+
+            if output_attentions:
+                outputs += (self_attn_weights,)
+                # lora part
+                lora_outputs += (lora_self_attn_weights,)
+
+            if use_cache:
+                outputs += (present_key_value,)
+                # lora part
+                lora_outputs += (lora_present_key_value,)
+
+            return outputs, lora_outputs
 
 class CustomLlamaModel(LlamaModel):
     def __init__(self, config: LlamaConfig):
@@ -231,6 +415,7 @@ class CustomLlamaModel(LlamaModel):
 
         # embed positions
         hidden_states = inputs_embeds
+        lora_hidden_states = inputs_embeds
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -244,9 +429,25 @@ class CustomLlamaModel(LlamaModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
+        model_status = kwargs["model_status"]
+
+        
+        if model_status == "eval":
+            exit_layers = kwargs["exit_layers"]
+            
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                #***************[MODIFY]***************
+                if model_status == "eval":
+                    all_hidden_states += (lora_hidden_states,)
+                elif model_status == "train":
+                    all_hidden_states += (hidden_states,)
+            
+            # if the current layer is one of the early exit layers, we need to 
+            # set the lora_hidden_states as the backbone hidden states
+                if model_status == "eval":
+                    if idx in exit_layers:
+                        lora_hidden_states = hidden_states
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
@@ -268,29 +469,57 @@ class CustomLlamaModel(LlamaModel):
                         print("received adapter_activation in LlamaModel: " + str(kwargs["adapter_activation"]))
                     
                     kwargs.update(adapter_activation=self.adapter_activation[idx].unsqueeze(0))
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    **kwargs
-                )
-
-            hidden_states = layer_outputs[0]
+                if model_status == "train":
+                    kwargs.pop('exit_layers', None)
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        **kwargs
+                    )
+                elif model_status == "eval":
+                    layer_outputs, lora_layer_outputs = decoder_layer(
+                            hidden_states,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            past_key_value=past_key_value,
+                            output_attentions=output_attentions,
+                            use_cache=use_cache,
+                            lora_hidden_states = lora_hidden_states,
+                            **kwargs
+                        )
+            
+            if model_status == "train":
+                hidden_states = layer_outputs[0]
+            elif model_status == "eval":
+                hidden_states = layer_outputs[0]
+                lora_hidden_states = lora_layer_outputs[0]
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-        hidden_states = self.norm(hidden_states)
+                #***************[MODIFY]***************
+                if model_status == "train":
+                    all_self_attns += (layer_outputs[1],)
+                elif model_status == "eval":
+                    all_self_attns += (lora_layer_outputs[1],)
+    
+        if model_status == "train":
+            hidden_states = self.norm(hidden_states)
+        elif model_status == "eval":
+            hidden_states = self.norm(hidden_states)
+            lora_hidden_states = self.norm(lora_hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            if model_status == "train":
+                all_hidden_states += (hidden_states,)
+            elif model_status == "eval":
+                all_hidden_states += (lora_hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
@@ -406,5 +635,6 @@ LlamaAttention.forward = CustomLlamaAttention.forward
 LlamaModel.__init__ = CustomLlamaModel.__init__
 LlamaModel.forward = CustomLlamaModel.forward
 LlamaForCausalLM.forward = CustomLlamaForCausalLM.forward
+LlamaDecoderLayer.forward = CustomLlamaDecoderLayer.forward
 
 
