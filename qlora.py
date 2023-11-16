@@ -10,6 +10,7 @@ from collections import defaultdict
 import copy
 import json
 import os
+import math
 from os.path import exists, join, isdir
 from dataclasses import dataclass, field
 import sys
@@ -47,7 +48,18 @@ from peft import (
 )
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+import wandb
 
+wandb.login(key = '4ae446ff2949b8d4204f01602d35746dd3fe37ab')
+wandb.init(
+    # Set the project where this run will be logged,
+    dir='/data/victorwang/qlora',
+    project="lora_early_exit",
+    # Track hyperparameters and run metadata
+    config={
+        "learning_rate": 0.0002,
+        "epochs": 6,
+    })
 
 def is_ipex_available():
     def get_major_and_minor_from_version(full_version):
@@ -749,6 +761,7 @@ def train():
         ]
         accuracy = evaluate.load("accuracy")
         #
+        confidence_exit = True
         class MMLUEvalCallback(transformers.TrainerCallback):
             def on_evaluate(self, args, state, control, model, **kwargs):
                 data_loader = trainer.get_eval_dataloader(mmlu_dataset)
@@ -759,15 +772,40 @@ def train():
                 loss_mmlu = 0
                 for batch in tqdm(data_loader, total=len(data_loader)):
                     #return loss hidden states, logits, labels
-                    (loss, logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False)
-                    print(f'loss is {loss}')
-                    print(f'labels is {labels}')
-                    print(f'hidden states is {hidden_states}')
-                   
+                    (loss, orig_logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False)
+                    exit_layers_logits = list()
+                    exit_layers = [8, 16, 24, 32]
+                    for idx in exit_layers:
+                        exit_layers_logits.append(torch.nn.functional.softmax(trainer.model.lm_head(hidden_states[idx].to(trainer.model.lm_head.weight.dtype))))
                     
-                    #return loss hiddenstates, logits, labels
-                    # There are two tokens, the output, and eos token.
-                    for i, logit in enumerate(logits):
+                    # input size: [exit_layer_num, batch_size, seq_len, vocab_dim]
+                    logits = torch.stack(exit_layers_logits, dim=0)
+                    if confidence_exit:
+                        lambda_const = 1
+                        N = logits.shape[2]
+                        temperature = 4
+                        threshold = [0.9 * lambda_const + 0.1 * math.exp(-temperature * t / N) for t in range(N)]
+                        threshold = torch.tensor(threshold, device=logits.device)[None, ...]
+                        exit_layer = (logits.shape[0]-1)*torch.ones(logits.shape[1:3],device=logits.device)
+                        initial_exit_layer = exit_layer
+                        for layer_num, layer_logit in enumerate(logits):
+                            test_val = torch.topk(layer_logit, k=2, dim=2)[0]
+                            test_val = (test_val[:,:,0] - test_val[:,:,1]).squeeze() 
+                            # if the top is greater than threshold and exit layer is still the last layer, modify to be current layer
+        
+                            mask = (test_val > threshold) & (exit_layer == initial_exit_layer)
+                            exit_layer[mask] = layer_num
+                            #exit_layer[(test_val > threshold) and (exit_layer == initial_exit_layer)] = layer_num
+                        
+                        
+                        final_logits = torch.zeros((orig_logits[0].shape))    # [batch_size, seq_len, vocab_dim]
+                        for i in range(final_logits.shape[1]):
+                            exit_layer = exit_layer.long()
+                            final_logits[:, i, :] = torch.squeeze(logits[exit_layer[:,i]])[i, :]
+        
+                    # output size: [batch_size, seq_len, vocab_dim]
+                    # logits = logits[0]
+                    for i, logit in enumerate(final_logits):
                         label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
                         logit_abcd = logit[label_non_zero_id-1][abcd_idx]
                         preds.append(torch.argmax(logit_abcd).item())

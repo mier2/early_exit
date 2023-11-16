@@ -828,7 +828,7 @@ class CustomTrainer(Trainer):
                         layer, (start, end) = self.iteration_queue[0]
                         if start <= current_iteration <= end:
                             self.exiting_layer = layer
-                            self.state.exiting_layer = layer
+                            # self.state.exiting_layer = layer
                         elif len(self.iteration_queue) > 1: 
                             self.iteration_queue.popleft()
                             self.exiting_layer = self.iteration_queue[0][0]
@@ -846,6 +846,7 @@ class CustomTrainer(Trainer):
 
                             if (f'layers.{i}.' in name) and (param.dtype.is_floating_point or param.dtype.is_complex):
                                 param.requires_grad_(True)
+
                     total_batched_samples += 1
                     if rng_to_sync:
                         self._load_rng_state(resume_from_checkpoint)
@@ -1019,13 +1020,13 @@ class CustomTrainer(Trainer):
             self._finish_current_push()
 
             return TrainOutput(self.state.global_step, train_loss, metrics)
+    
     def compute_loss(self, model, inputs, return_outputs=False):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
         Subclass and override for custom behavior.
         """
-            
 
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
@@ -1033,10 +1034,13 @@ class CustomTrainer(Trainer):
             labels = None
         
         chosen_layer = self.exiting_layer
-
-        
+    
         start_index = max(chosen_layer + 1 - self.stride_size, 0)
         end_index = chosen_layer + 1
+
+        # for name, param in model.named_parameters():
+        #     if param.requires_grad == True:
+        #         print(name)
 
         layer_list = [1 if start_index <= i < end_index else 0 for i in range(self.num_layers)]
 
@@ -1066,9 +1070,8 @@ class CustomTrainer(Trainer):
         shift_labels = shift_labels.to(shift_logits.device)
         loss = loss_fct(shift_logits, shift_labels)
         
-        
-
         return (loss, outputs) if return_outputs else loss
+    
     def prediction_step(
         self,
         model: nn.Module,
@@ -1101,7 +1104,7 @@ class CustomTrainer(Trainer):
         """
         inputs['model_status'] = "eval"
         inputs['adapter_activation'] = torch.ones(self.num_layers)
-        inputs['exit_layers'] = self.exiting_layer
+        inputs['exit_layers'] = [7, 15, 23, 31]
         inputs['output_hidden_states'] = True
 
 
