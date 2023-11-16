@@ -2,9 +2,9 @@
 # LICENSE file in the root directory of this source tree.
 
 
-import bnb_wrappers
-import modeling_llama_wrappers
-import trainer_wrappers
+# import bnb_wrappers
+# import modeling_llama_wrappers
+# import trainer_wrappers
 
 from collections import defaultdict
 import copy
@@ -48,18 +48,18 @@ from peft import (
 )
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
 import wandb
 
-wandb.login(key = '4ae446ff2949b8d4204f01602d35746dd3fe37ab')
-wandb.init(
-    # Set the project where this run will be logged,
-    dir='/data/victorwang/qlora',
-    project="lora_early_exit",
-    # Track hyperparameters and run metadata
-    config={
-        "learning_rate": 0.0002,
-        "epochs": 6,
-    })
+# wandb.login(key = '4ae446ff2949b8d4204f01602d35746dd3fe37ab')
+# wandb.init(
+#     # Set the project where this run will be logged
+#     project="lora_early_exit",
+#     # Track hyperparameters and run metadata
+#     config={
+#         "learning_rate": 0.0002,
+#         "epochs": 6,
+#     })
 
 def is_ipex_available():
     def get_major_and_minor_from_version(full_version):
@@ -796,7 +796,6 @@ def train():
                             mask = (test_val > threshold) & (exit_layer == initial_exit_layer)
                             exit_layer[mask] = layer_num
                             #exit_layer[(test_val > threshold) and (exit_layer == initial_exit_layer)] = layer_num
-                        
                         
                         final_logits = torch.zeros((orig_logits[0].shape))    # [batch_size, seq_len, vocab_dim]
                         for i in range(final_logits.shape[1]):

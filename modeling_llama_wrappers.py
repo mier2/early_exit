@@ -526,7 +526,7 @@ class CustomLlamaModel(LlamaModel):
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         if model_status == "train":
             return BaseModelOutputWithPast(
-                last_hidden_state=hidden_states,
+                last_hidden_state=hidden_states[-1],
                 past_key_values=next_cache,
                 hidden_states=all_hidden_states,
                 attentions=all_self_attns,
