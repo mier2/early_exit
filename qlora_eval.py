@@ -1,10 +1,16 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+
+import bnb_wrappers_eval
+import modeling_llama_wrappers_eval
+import trainer_wrappers
+
 from collections import defaultdict
 import copy
 import json
 import os
+import math
 from os.path import exists, join, isdir
 from dataclasses import dataclass, field
 import sys
@@ -42,9 +48,7 @@ from peft import (
 )
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-import bnb_wrappers
-import modeling_llama_wrappers
-import trainer_wrappers
+
 import wandb
 
 wandb.login(key = '4ae446ff2949b8d4204f01602d35746dd3fe37ab')
@@ -216,7 +220,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
     remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
     max_grad_norm: float = field(default=0.3, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
-    gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
+    # gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
     do_train: bool = field(default=True, metadata={"help": 'To train or not to train, that is the question?'})
     lr_scheduler_type: str = field(default='constant', metadata={"help": 'Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis'})
     warmup_ratio: float = field(default=0.03, metadata={"help": 'Fraction of steps to do a warmup for'})
@@ -756,6 +760,8 @@ def train():
             tokenizer("D", add_special_tokens=False).input_ids[0],
         ]
         accuracy = evaluate.load("accuracy")
+        #
+        confidence_exit = True
         class MMLUEvalCallback(transformers.TrainerCallback):
             def on_evaluate(self, args, state, control, model, **kwargs):
                 data_loader = trainer.get_eval_dataloader(mmlu_dataset)
@@ -765,9 +771,40 @@ def train():
                 preds, refs = [], []
                 loss_mmlu = 0
                 for batch in tqdm(data_loader, total=len(data_loader)):
-                    (loss, logits, labels) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
-                    # There are two tokens, the output, and eos token.
-                    for i, logit in enumerate(logits):
+                    #return loss hidden states, logits, labels
+                    (loss, orig_logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False)
+                    exit_layers_logits = list()
+                    exit_layers = [8, 16, 24, 32]
+                    for idx in exit_layers:
+                        exit_layers_logits.append(torch.nn.functional.softmax(trainer.model.lm_head(hidden_states[idx].to(trainer.model.lm_head.weight.dtype))))
+                    
+                    # input size: [exit_layer_num, batch_size, seq_len, vocab_dim]
+                    logits = torch.stack(exit_layers_logits, dim=0)
+                    if confidence_exit:
+                        lambda_const = 1
+                        N = logits.shape[2]
+                        temperature = 4
+                        threshold = [0.9 * lambda_const + 0.1 * math.exp(-temperature * t / N) for t in range(N)]
+                        threshold = torch.tensor(threshold, device=logits.device)[None, ...]
+                        exit_layer = (logits.shape[0]-1)*torch.ones(logits.shape[1:3],device=logits.device)
+                        initial_exit_layer = exit_layer
+                        for layer_num, layer_logit in enumerate(logits):
+                            test_val = torch.topk(layer_logit, k=2, dim=2)[0]
+                            test_val = (test_val[:,:,0] - test_val[:,:,1]).squeeze() 
+                            # if the top is greater than threshold and exit layer is still the last layer, modify to be current layer
+        
+                            mask = (test_val > threshold) & (exit_layer == initial_exit_layer)
+                            exit_layer[mask] = layer_num
+                            #exit_layer[(test_val > threshold) and (exit_layer == initial_exit_layer)] = layer_num
+                        
+                        final_logits = torch.zeros((orig_logits[0].shape))    # [batch_size, seq_len, vocab_dim]
+                        for i in range(final_logits.shape[1]):
+                            exit_layer = exit_layer.long()
+                            final_logits[:, i, :] = torch.squeeze(logits[exit_layer[:,i]])[i, :]
+        
+                    # output size: [batch_size, seq_len, vocab_dim]
+                    # logits = logits[0]
+                    for i, logit in enumerate(final_logits):
                         label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
                         logit_abcd = logit[label_non_zero_id-1][abcd_idx]
                         preds.append(torch.argmax(logit_abcd).item())
@@ -793,7 +830,7 @@ def train():
                 trainer.log(results)
                 trainer.data_collator.source_max_len = source_max_len
 
-        trainer.add_callback(MMLUEvalCallback)
+        # trainer.add_callback(MMLUEvalCallback)
 
     # Verifying the datatypes and parameter counts before training.
     print_trainable_parameters(args, model)

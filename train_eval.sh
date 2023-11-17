@@ -1,6 +1,6 @@
 export HF_HOME=/data/victorwang/hugging_face_cache
 
-CUDA_VISIBLE_DEVICES=4 python qlora.py \
+CUDA_VISIBLE_DEVICES=5 python qlora_eval.py \
     --model_name_or_path huggyllama/llama-7b \
     --output_dir ./output/guanaco-7b \
     --logging_steps 10 \
@@ -36,7 +36,6 @@ CUDA_VISIBLE_DEVICES=4 python qlora.py \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --max_steps 3750 \
-    --report_to wandb \
     --eval_steps 200 \
     --learning_rate 0.0002 \
     --adam_beta2 0.999 \

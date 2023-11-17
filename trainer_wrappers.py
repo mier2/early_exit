@@ -1070,7 +1070,7 @@ class CustomTrainer(Trainer):
         shift_labels = shift_labels.to(shift_logits.device)
         loss = loss_fct(shift_logits, shift_labels)
         
-        print(loss)
+        # print(loss)
         return (loss, outputs) if return_outputs else loss
     
     def prediction_step(
