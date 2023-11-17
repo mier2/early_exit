@@ -770,6 +770,7 @@ def train():
                 trainer.model.eval()
                 preds, refs = [], []
                 loss_mmlu = 0
+                preds_layer1, preds_layer2, preds_layer3, preds_layer4 = [], [], [], []
                 for batch in tqdm(data_loader, total=len(data_loader)):
                     #return loss hidden states, logits, labels
                     (loss, orig_logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False)
@@ -804,6 +805,18 @@ def train():
         
                     # output size: [batch_size, seq_len, vocab_dim]
                     # logits = logits[0]
+                    exit_layers_preds = list() 
+                    
+                    for logit in exit_layers_logits:
+                        label_non_zero_id = (batch['labels'][0] != -100).nonzero()[0][0]
+                        logit_abcd = logit[0][label_non_zero_id-1][abcd_idx]
+                        exit_layers_preds.append(torch.argmax(logit_abcd).item())
+
+                    preds_layer1.append(exit_layers_preds[0])
+                    preds_layer2.append(exit_layers_preds[1])
+                    preds_layer3.append(exit_layers_preds[2])
+                    preds_layer4.append(exit_layers_preds[3])
+
                     for i, logit in enumerate(final_logits):
                         label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
                         logit_abcd = logit[label_non_zero_id-1][abcd_idx]
@@ -811,24 +824,95 @@ def train():
                     labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
                     refs += [abcd_idx.index(label) for label in labels.tolist()]
                     loss_mmlu += loss.item()
-                # Extract results by subject.
+
                 results = {'mmlu_loss':loss_mmlu/len(data_loader)}
                 subject = mmlu_dataset['subject']
-                subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
-                for s,p,r in zip(subject, preds, refs):
+                subjects = {s:{'refs':[], 'preds':[], 'preds_layer1': [], 'preds_layer2': [], 'preds_layer3': [], 'preds_layer4': []} for s in set(subject)}
+                for s,p,r, pr1, pr2, pr3, pr4 in zip(subject, preds, refs, preds_layer1, preds_layer2, preds_layer3, preds_layer4):
                     subjects[s]['preds'].append(p)
                     subjects[s]['refs'].append(r)
+                    subjects[s]['preds_layer1'].append(pr1)
+                    subjects[s]['preds_layer2'].append(pr2)
+                    subjects[s]['preds_layer3'].append(pr3)
+                    subjects[s]['preds_layer4'].append(pr4)
+                
+
                 subject_scores = []
+                subject_scores_layer1 = []
+                subject_scores_layer2 = []
+                subject_scores_layer3 = []
+                subject_scores_layer4 = []
+
                 for subject in subjects:
                     subject_score = accuracy.compute(
                         references=subjects[subject]['refs'],
                         predictions=subjects[subject]['preds']
                     )['accuracy']
+                    subject_score_layer1 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_layer1']
+                    )['accuracy']
+                    subject_score_layer2 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_layer2']
+                    )['accuracy']
+                    subject_score_layer3 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_layer3']
+                    )['accuracy']
+                    subject_score_layer4 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_layer4']
+                    )['accuracy']
+
                     results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
-                    subject_scores.append(subject_score)
+                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer1'] = subject_score_layer1
+                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer2'] = subject_score_layer2
+                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer3'] = subject_score_layer3
+                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer4'] = subject_score_layer4
+
+
                 results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
+
+                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer1'] = np.mean(subject_scores_layer1)
+                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer2'] = np.mean(subject_scores_layer2)
+                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer3'] = np.mean(subject_scores_layer3)
+                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer4'] = np.mean(subject_scores_layer4)
+                
                 trainer.log(results)
                 trainer.data_collator.source_max_len = source_max_len
+
+        trainer.add_callback(MMLUEvalCallback)
+        #             for e in exit_layers_logits:
+        #                 label_non_zero_id = (batch['labels'][0] != -100).nonzero()[0][0]
+        #                 logit_abcd = e[label_non_zero_id-1][abcd_idx]
+        #                 preds.append(torch.argmax(logit_abcd).item())
+
+        #             for i, logit in enumerate(final_logits):
+        #                 label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+        #                 logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+        #                 preds.append(torch.argmax(logit_abcd).item())
+        #             labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
+        #             refs += [abcd_idx.index(label) for label in labels.tolist()]
+        #             loss_mmlu += loss.item()
+        #         # Extract results by subject.
+        #         results = {'mmlu_loss':loss_mmlu/len(data_loader)}
+        #         subject = mmlu_dataset['subject']
+        #         subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
+        #         for s,p,r in zip(subject, preds, refs):
+        #             subjects[s]['preds'].append(p)
+        #             subjects[s]['refs'].append(r)
+        #         subject_scores = []
+        #         for subject in subjects:
+        #             subject_score = accuracy.compute(
+        #                 references=subjects[subject]['refs'],
+        #                 predictions=subjects[subject]['preds']
+        #             )['accuracy']
+        #             results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
+        #             subject_scores.append(subject_score)
+        #         results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
+        #         trainer.log(results)
+        #         trainer.data_collator.source_max_len = source_max_len
 
         # trainer.add_callback(MMLUEvalCallback)
 
