@@ -1,6 +1,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-
+import random
 from collections import defaultdict
 import copy
 import json
@@ -42,8 +42,8 @@ from peft import (
 )
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-import bnb_wrappers
-import modeling_llama_wrappers
+import bnb_wrappers_eval
+import modeling_llama_wrappers_eval
 import trainer_wrappers
 import wandb
 
@@ -764,13 +764,18 @@ def train():
                 trainer.model.eval()
                 preds, refs = [], []
                 loss_mmlu = 0
+                exit_layers = [8, 16, 24, 32]
+
                 for batch in tqdm(data_loader, total=len(data_loader)):
-                    (loss, logits, labels) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
+                    (loss, logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
+                    random_exit_layer = random.choice(exit_layers)
+                    logit = trainer.model.lm_head(hidden_states[random_exit_layer].to(trainer.model.lm_head.weight.dtype))
                     # There are two tokens, the output, and eos token.
-                    for i, logit in enumerate(logits):
+                    for i, logit in enumerate(logits[0]):
                         label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
                         logit_abcd = logit[label_non_zero_id-1][abcd_idx]
                         preds.append(torch.argmax(logit_abcd).item())
+                    
                     labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
                     refs += [abcd_idx.index(label) for label in labels.tolist()]
                     loss_mmlu += loss.item()

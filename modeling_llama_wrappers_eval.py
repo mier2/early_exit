@@ -469,7 +469,6 @@ class CustomLlamaModel(LlamaModel):
                     **kwargs,
                 )
             else:
-                print("************************")
                 if "adapter_activation" in kwargs:
                     #adapter_activation
                     if(len(kwargs["adapter_activation"]) == len(self.layers)) and not(torch.equal(self.adapter_activation.cuda(), kwargs["adapter_activation"].cuda())):

@@ -62,7 +62,10 @@ class CustomLinear8bitLt(Linear8bitLt):
                     if model_status == "train":
                         lora_output = lora_B(lora_A(dropout(hidden_states)))
                     if "adapter_activation" in kwargs:
-                        lora_output = lora_output * kwargs["adapter_activation"]
+                        if len(kwargs["adapter_activation"] > 1):
+                            lora_output = lora_output * kwargs["adapter_activation"][0].unsqueeze(0)
+                        else:
+                            lora_output = lora_output * kwargs["adapter_activation"]
                     if requires_conversion:
                         lora_output = lora_output.to(expected_dtype)
                     lora_output = lora_output * scaling
