@@ -40,10 +40,14 @@ from peft import (
 )
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+import wandb
 
-import bnb_wrappers_eval
-import modeling_llama_wrappers_eval
-import trainer_wrappers
+wandb.login()
+wandb.init(
+    # Set the project where this run will be logged
+    project="lora_early_exit",
+    )
+
 
 if torch.cuda.is_available():   
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -279,7 +283,69 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     )
 
 
+
 model_checkpoint = "checkpoint-1000"
 
 model = AutoModelForCausalLM.from_pretrained(model_checkpoint, load_in_8bit=True, device_map="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
+
+
+
+# MMLU Five-shot (Eval/Test only)
+mmlu_dataset = load_dataset("json", data_files={
+    'eval': 'data/mmlu/five_shot_mmlu_val.json',
+    'test': 'data/mmlu/five_shot_mmlu_test.json',
+})
+# mmlu_dataset = mmlu_dataset.remove_columns('subject')
+mmlu_dataset = mmlu_dataset['eval']
+
+abcd_idx = [
+tokenizer("A", add_special_tokens=False).input_ids[0],
+tokenizer("B", add_special_tokens=False).input_ids[0],
+tokenizer("C", add_special_tokens=False).input_ids[0],
+tokenizer("D", add_special_tokens=False).input_ids[0],
+]
+data_collator = DataCollatorForCausalLM(
+        tokenizer=tokenizer,
+        source_max_len=1024,
+        target_max_len=256,
+        train_on_source=False,
+        predict_with_generate=False,
+    )
+data_loader = DataLoader(mmlu_dataset, collate_fn=data_collator, batch_size=1)
+preds, refs = [], []
+loss_mmlu = 0
+accuracy = evaluate.load("accuracy")
+for batch in tqdm(data_loader, total=len(data_loader)):
+    labels = batch['labels']
+    batch['return_dict'] = True
+    outputs = model(**batch)
+    logits = outputs['logits']
+    loss = outputs['loss']
+    # There are two tokens, the output, and eos token.
+    for i, logit in enumerate(logits):
+        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+        preds.append(torch.argmax(logit_abcd).item())
+    labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
+    refs += [abcd_idx.index(label) for label in labels.tolist()]
+    loss_mmlu += loss.item()
+# Extract results by subject.
+results = {'mmlu_loss':loss_mmlu/len(data_loader)}
+subject = mmlu_dataset['subject']
+subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
+for s,p,r in zip(subject, preds, refs):
+    subjects[s]['preds'].append(p)
+    subjects[s]['refs'].append(r)
+subject_scores = []
+for subject in subjects:
+    subject_score = accuracy.compute(
+        references=subjects[subject]['refs'],
+        predictions=subjects[subject]['preds']
+    )['accuracy']
+    results[f'mmlu_eval_accuracy_{subject}'] = subject_score
+    subject_scores.append(subject_score)
+results[f'mmlu_eval_accuracy'] = np.mean(subject_scores)
+wandb.log(results)
+
+wandb.finish()
