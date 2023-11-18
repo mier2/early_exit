@@ -51,15 +51,15 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
 import wandb
 
-wandb.login(key = '4ae446ff2949b8d4204f01602d35746dd3fe37ab')
-wandb.init(
-    # Set the project where this run will be logged
-    project="lora_early_exit",
-    # Track hyperparameters and run metadata
-    config={
-        "learning_rate": 0.0002,
-        "epochs": 6,
-    })
+# wandb.login(key = '4ae446ff2949b8d4204f01602d35746dd3fe37ab')
+# wandb.init(
+#     # Set the project where this run will be logged
+#     project="lora_early_exit",
+#     # Track hyperparameters and run metadata
+#     config={
+#         "learning_rate": 0.0002,
+#         "epochs": 6,
+#     })
 
 def is_ipex_available():
     def get_major_and_minor_from_version(full_version):
@@ -761,7 +761,11 @@ def train():
         ]
         accuracy = evaluate.load("accuracy")
         #
-        confidence_exit = True
+        merge_method = 0
+        # 0: confidence exit by top2
+        # 1: probability mean
+        # 2: arithmetic sequence weighted mean (diff = 2/(num_block+1)*4) -> 0.1, 0.2, 0.3, 0.4
+        # 3: top candidate token from each output
         class MMLUEvalCallback(transformers.TrainerCallback):
             def on_evaluate(self, args, state, control, model, **kwargs):
                 data_loader = trainer.get_eval_dataloader(mmlu_dataset)
@@ -779,31 +783,47 @@ def train():
                     for idx in exit_layers:
                         exit_layers_logits.append(torch.nn.functional.softmax(trainer.model.lm_head(hidden_states[idx].to(trainer.model.lm_head.weight.dtype))))
                     
-                    # input size: [exit_layer_num, batch_size, seq_len, vocab_dim]
+                    # input size: [exit_layer_num, batch_size, seq_len, vocab_dim] logits
                     logits = torch.stack(exit_layers_logits, dim=0)
-                    if confidence_exit:
-                        lambda_const = 1
-                        N = logits.shape[2]
-                        temperature = 4
-                        threshold = [0.9 * lambda_const + 0.1 * math.exp(-temperature * t / N) for t in range(N)]
-                        threshold = torch.tensor(threshold, device=logits.device)[None, ...]
-                        exit_layer = (logits.shape[0]-1)*torch.ones(logits.shape[1:3],device=logits.device)
-                        initial_exit_layer = exit_layer
-                        for layer_num, layer_logit in enumerate(logits):
-                            test_val = torch.topk(layer_logit, k=2, dim=2)[0]
-                            test_val = (test_val[:,:,0] - test_val[:,:,1]).squeeze() 
-                            # if the top is greater than threshold and exit layer is still the last layer, modify to be current layer
+                    match merge_method:
+                        case 0:
+                            lambda_const = 1
+                            N = logits.shape[2]
+                            temperature = 4
+                            threshold = [0.9 * lambda_const + 0.1 * math.exp(-temperature * t / N) for t in range(N)]
+                            threshold = torch.tensor(threshold, device=logits.device)[None, ...]
+                            exit_layer = (logits.shape[0]-1)*torch.ones(logits.shape[1:3],device=logits.device)
+                            initial_exit_layer = exit_layer
+                            for layer_num, layer_logit in enumerate(logits):
+                                test_val = torch.topk(layer_logit, k=2, dim=2)[0]
+                                test_val = (test_val[:,:,0] - test_val[:,:,1]).squeeze() 
+                                # if the top is greater than threshold and exit layer is still the last layer, modify to be current layer
+            
+                                mask = (test_val > threshold) & (exit_layer == initial_exit_layer)
+                                exit_layer[mask] = layer_num
+                                #exit_layer[(test_val > threshold) and (exit_layer == initial_exit_layer)] = layer_num
+
+                            print(exit_layer)
+                            print("*********")
+                            
+                            final_logits = torch.zeros((orig_logits[0].shape))    # [batch_size, seq_len, vocab_dim]
+                            for i in range(final_logits.shape[1]):
+                                exit_layer = exit_layer.long()
+                                final_logits[:, i, :] = torch.squeeze(logits[exit_layer[:,i]])[i, :]
+
+                        case 1:
+                            final_logits = torch.mean(logits, dim=0)
+
+                        case 2:
+                            weights = [2/((logits.shape[0]+1)*4)*(n+1) for n in range(logits.shape[0])] # normalized weights
+                            weights = torch.tensor(weights, device=logits.device)
+                            final_logits = torch.sum(weights[:, None, None, None] * logits, dim=0)
+
+                        case 3:
+                            topk = torch.topk(logits, k=1, dim=0)[0].squeeze(dim=0)
+                            final_logits = topk/torch.sum(topk, dim=2)[:,:,None]
         
-                            mask = (test_val > threshold) & (exit_layer == initial_exit_layer)
-                            exit_layer[mask] = layer_num
-                            #exit_layer[(test_val > threshold) and (exit_layer == initial_exit_layer)] = layer_num
-                        
-                        final_logits = torch.zeros((orig_logits[0].shape))    # [batch_size, seq_len, vocab_dim]
-                        for i in range(final_logits.shape[1]):
-                            exit_layer = exit_layer.long()
-                            final_logits[:, i, :] = torch.squeeze(logits[exit_layer[:,i]])[i, :]
-        
-                    # output size: [batch_size, seq_len, vocab_dim]
+                    # output size: [batch_size, seq_len, vocab_dim] final_logits
                     # logits = logits[0]
                     exit_layers_preds = list() 
                     
