@@ -154,6 +154,8 @@ cython_debug/
 
 .DS_Store
 
+eval/chekpoint-1000
+
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
