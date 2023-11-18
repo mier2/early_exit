@@ -773,6 +773,7 @@ def train():
                 trainer.data_collator.source_max_len = args.mmlu_source_max_len
                 trainer.model.eval()
                 preds, refs = [], []
+                comb_preds1, comb_preds2, comb_preds3 = [], [], []
                 loss_mmlu = 0
                 preds_layer1, preds_layer2, preds_layer3, preds_layer4 = [], [], [], []
                 for batch in tqdm(data_loader, total=len(data_loader)):
@@ -785,43 +786,43 @@ def train():
                     
                     # input size: [exit_layer_num, batch_size, seq_len, vocab_dim] logits
                     logits = torch.stack(exit_layers_logits, dim=0)
-                    match merge_method:
-                        case 0:
-                            lambda_const = 1
-                            N = logits.shape[2]
-                            temperature = 4
-                            threshold = [0.9 * lambda_const + 0.1 * math.exp(-temperature * t / N) for t in range(N)]
-                            threshold = torch.tensor(threshold, device=logits.device)[None, ...]
-                            exit_layer = (logits.shape[0]-1)*torch.ones(logits.shape[1:3],device=logits.device)
-                            initial_exit_layer = exit_layer
-                            for layer_num, layer_logit in enumerate(logits):
-                                test_val = torch.topk(layer_logit, k=2, dim=2)[0]
-                                test_val = (test_val[:,:,0] - test_val[:,:,1]).squeeze() 
-                                # if the top is greater than threshold and exit layer is still the last layer, modify to be current layer
-            
-                                mask = (test_val > threshold) & (exit_layer == initial_exit_layer)
-                                exit_layer[mask] = layer_num
-                                #exit_layer[(test_val > threshold) and (exit_layer == initial_exit_layer)] = layer_num
+                    # match merge_method:
+                        # case 0:
+                    lambda_const = 1
+                    N = logits.shape[2]
+                    temperature = 4
+                    threshold = [0.9 * lambda_const + 0.1 * math.exp(-temperature * t / N) for t in range(N)]
+                    threshold = torch.tensor(threshold, device=logits.device)[None, ...]
+                    exit_layer = (logits.shape[0]-1)*torch.ones(logits.shape[1:3],device=logits.device)
+                    initial_exit_layer = exit_layer
+                    for layer_num, layer_logit in enumerate(logits):
+                        test_val = torch.topk(layer_logit, k=2, dim=2)[0]
+                        test_val = (test_val[:,:,0] - test_val[:,:,1]).squeeze() 
+                        # if the top is greater than threshold and exit layer is still the last layer, modify to be current layer
+    
+                        mask = (test_val > threshold) & (exit_layer == initial_exit_layer)
+                        exit_layer[mask] = layer_num
+                        #exit_layer[(test_val > threshold) and (exit_layer == initial_exit_layer)] = layer_num
 
-                            print(exit_layer)
-                            print("*********")
-                            
-                            final_logits = torch.zeros((orig_logits[0].shape))    # [batch_size, seq_len, vocab_dim]
-                            for i in range(final_logits.shape[1]):
-                                exit_layer = exit_layer.long()
-                                final_logits[:, i, :] = torch.squeeze(logits[exit_layer[:,i]])[i, :]
+                    print(exit_layer)
+                    print("*********")
+                    
+                    final_logits = torch.zeros((orig_logits[0].shape))    # [batch_size, seq_len, vocab_dim]
+                    for i in range(final_logits.shape[1]):
+                        exit_layer = exit_layer.long()
+                        final_logits[:, i, :] = torch.squeeze(logits[exit_layer[:,i]])[i, :]
 
-                        case 1:
-                            final_logits = torch.mean(logits, dim=0)
+                        # case 1:
+                    final_logits_1 = torch.mean(logits, dim=0)
 
-                        case 2:
-                            weights = [2/((logits.shape[0]+1)*4)*(n+1) for n in range(logits.shape[0])] # normalized weights
-                            weights = torch.tensor(weights, device=logits.device)
-                            final_logits = torch.sum(weights[:, None, None, None] * logits, dim=0)
+                        # case 2:
+                    weights = [2/((logits.shape[0]+1)*4)*(n+1) for n in range(logits.shape[0])] # normalized weights
+                    weights = torch.tensor(weights, device=logits.device)
+                    final_logits_2 = torch.sum(weights[:, None, None, None] * logits, dim=0)
 
-                        case 3:
-                            topk = torch.topk(logits, k=1, dim=0)[0].squeeze(dim=0)
-                            final_logits = topk/torch.sum(topk, dim=2)[:,:,None]
+                        # case 3:
+                    topk = torch.topk(logits, k=1, dim=0)[0].squeeze(dim=0)
+                    final_logits_3 = topk/torch.sum(topk, dim=2)[:,:,None]
         
                     # output size: [batch_size, seq_len, vocab_dim] final_logits
                     # logits = logits[0]
@@ -837,32 +838,48 @@ def train():
                     preds_layer3.append(exit_layers_preds[2])
                     preds_layer4.append(exit_layers_preds[3])
 
+
                     for i, logit in enumerate(final_logits):
                         label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
                         logit_abcd = logit[label_non_zero_id-1][abcd_idx]
                         preds.append(torch.argmax(logit_abcd).item())
+                    for i, logit in enumerate(final_logits_1):
+                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        comb_preds1.append(torch.argmax(logit_abcd).item())
+                    for i, logit in enumerate(final_logits_2):
+                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        comb_preds2.append(torch.argmax(logit_abcd).item())
+                    for i, logit in enumerate(final_logits_3):
+                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        comb_preds3.append(torch.argmax(logit_abcd).item())
                     labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
                     refs += [abcd_idx.index(label) for label in labels.tolist()]
                     loss_mmlu += loss.item()
 
                 results = {'mmlu_loss':loss_mmlu/len(data_loader)}
                 subject = mmlu_dataset['subject']
-                subjects = {s:{'refs':[], 'preds':[], 'preds_layer1': [], 'preds_layer2': [], 'preds_layer3': [], 'preds_layer4': []} for s in set(subject)}
-                for s,p,r, pr1, pr2, pr3, pr4 in zip(subject, preds, refs, preds_layer1, preds_layer2, preds_layer3, preds_layer4):
+                subjects = {s:{'refs':[], 'preds':[], 'preds_layer1': [], 'preds_layer2': [], 'preds_layer3': [], 'preds_layer4': [], 'preds_comb1': [], "preds_comb2": [], "preds_comb3": []} for s in set(subject)}
+                for s,p,r, pr1, pr2, pr3, pr4, comb1, comb2, comb3 in zip(subject, preds, refs, preds_layer1, preds_layer2, preds_layer3, preds_layer4, comb_preds1, comb_preds2, comb_preds3):
                     subjects[s]['preds'].append(p)
                     subjects[s]['refs'].append(r)
                     subjects[s]['preds_layer1'].append(pr1)
                     subjects[s]['preds_layer2'].append(pr2)
                     subjects[s]['preds_layer3'].append(pr3)
                     subjects[s]['preds_layer4'].append(pr4)
-                
-
+                    subjects[s]['preds_comb1'].append(comb1)
+                    subjects[s]['preds_comb2'].append(comb2)
+                    subjects[s]['preds_comb3'].append(comb3)
                 subject_scores = []
                 subject_scores_layer1 = []
                 subject_scores_layer2 = []
                 subject_scores_layer3 = []
                 subject_scores_layer4 = []
-
+                subject_scores_comb1 = []
+                subject_scores_comb2 = []
+                subject_scores_comb3 = []
                 for subject in subjects:
                     subject_score = accuracy.compute(
                         references=subjects[subject]['refs'],
@@ -884,20 +901,45 @@ def train():
                         references=subjects[subject]['refs'],
                         predictions=subjects[subject]['preds_layer4']
                     )['accuracy']
-
+                    subject_score_comb1 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_comb1']
+                    )['accuracy']
+                    subject_score_comb2 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_comb2']
+                    )['accuracy']
+                    subject_score_comb3 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_comb3']
+                    )['accuracy']
                     results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
-                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer1'] = subject_score_layer1
-                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer2'] = subject_score_layer2
-                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer3'] = subject_score_layer3
-                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer4'] = subject_score_layer4
-
-
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer1'] = subject_score_layer1
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer2'] = subject_score_layer2
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer3'] = subject_score_layer3
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer4'] = subject_score_layer4
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_comb1'] = subject_score_comb1
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_comb2'] = subject_score_comb2
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_comb3'] = subject_score_comb3
+                    subject_scores.append(subject_score)
+                    subject_scores_layer1.append(subject_score_layer1)
+                    subject_scores_layer2.append(subject_score_layer2)
+                    subject_scores_layer3.append(subject_score_layer3)
+                    subject_scores_layer4.append(subject_score_layer4)
+                    subject_scores_comb1.append(subject_score_comb1)
+                    subject_scores_comb2.append(subject_score_comb2)
+                    subject_scores_comb3.append(subject_score_comb3)
                 results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
-
                 results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer1'] = np.mean(subject_scores_layer1)
                 results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer2'] = np.mean(subject_scores_layer2)
                 results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer3'] = np.mean(subject_scores_layer3)
                 results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer4'] = np.mean(subject_scores_layer4)
+                results[f'mmlu_{args.mmlu_split}_accuracy_comb1'] = np.mean(subject_scores_comb1)
+                results[f'mmlu_{args.mmlu_split}_accuracy_comb2'] = np.mean(subject_scores_comb2)
+                results[f'mmlu_{args.mmlu_split}_accuracy_comb3'] = np.mean(subject_scores_comb3)
+                print(f"{np.mean(subject_scores_layer1)}, {np.mean(subject_scores_layer2)}, {np.mean(subject_scores_layer3)}, {np.mean(subject_scores_layer4)}, {np.mean(subject_scores_comb1)}, {np.mean(subject_scores_comb2)}, {np.mean(subject_scores_comb3)}")
+
+
                 
                 trainer.log(results)
                 trainer.data_collator.source_max_len = source_max_len
