@@ -780,9 +780,11 @@ def train():
                 for i in exit_layers:
                     linear_layers.append(getattr(base.layers[i-1], f'linear_layer_{i-1}'))
 
+                logits_to_save = []
                 for batch in tqdm(data_loader, total=len(data_loader)):
                     #return loss hidden states, logits, labels
                     (loss, orig_logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False)
+                    logits_to_save.append(torch.stack(hidden_states)) # [number_of_batch, exit_layer_num, batch_size, seq_len, vocab_dim]
                     exit_layers_logits = list()
                     for i, idx in enumerate(exit_layers):
                         exit_layers_logits.append(torch.nn.functional.softmax(linear_layers[i](hidden_states[idx].to(trainer.model.lm_head.weight.dtype)), dim=-1))
@@ -1000,6 +1002,17 @@ def train():
                 print(f"{np.mean(subject_scores_layer1)}, {np.mean(subject_scores_layer2)}, {np.mean(subject_scores_layer3)}, {np.mean(subject_scores_layer4)},\
                       {np.mean(subject_scores_comb1)}, {np.mean(subject_scores_comb2)}, {np.mean(subject_scores_comb3)}, {np.mean(subject_scores_comb4)}, \
                       {np.mean(subject_scores_comb5)}, {np.mean(subject_scores_comb6)}")
+
+                overall_acc = np.array([results[f'mmlu_{args.mmlu_split}_accuracy'],\
+                    results[f'mmlu_{args.mmlu_split}_accuracy_comb1'],\
+                    results[f'mmlu_{args.mmlu_split}_accuracy_comb2'],\
+                    results[f'mmlu_{args.mmlu_split}_accuracy_comb3'],\
+                    results[f'mmlu_{args.mmlu_split}_accuracy_comb4'],\
+                    results[f'mmlu_{args.mmlu_split}_accuracy_comb5'],\
+                    results[f'mmlu_{args.mmlu_split}_accuracy_comb6']])
+                overall_acc = np.mean(overall_acc)
+                global_step = state.global_step
+                torch.save(logits_to_save, f'saved_logits/all_logits_{global_step}_{overall_acc}.pt')
 
                 trainer.log(results)
                 trainer.data_collator.source_max_len = source_max_len

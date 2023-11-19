@@ -1,12 +1,12 @@
-export HF_HOME=/data/victorwang/hugging_face_cache
+export HF_HOME=/data/zyu401_data/yuhan/early_exit/HF
 
-CUDA_VISIBLE_DEVICES=4 python qlora.py \
+CUDA_VISIBLE_DEVICES=5 python qlora.py \
     --model_name_or_path huggyllama/llama-7b \
     --output_dir ./output/guanaco-7b \
     --logging_steps 10 \
     --save_strategy steps \
     --data_seed 42 \
-    --save_steps 500 \
+    --save_steps 200 \
     --save_total_limit 40 \
     --evaluation_strategy steps \
     --eval_dataset_size 1024 \
@@ -20,7 +20,7 @@ CUDA_VISIBLE_DEVICES=4 python qlora.py \
     --do_train \
     --do_eval \
     --do_mmlu_eval \
-    --lora_r 64 \
+    --lora_r 8 \
     --lora_alpha 16 \
     --lora_modules all \
     --double_quant \

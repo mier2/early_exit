@@ -1,6 +1,6 @@
-export HF_HOME=/data/victorwang/hugging_face_cache
+export HF_HOME=/data/zyu401_data/yuhan/early_exit/HF
 
-CUDA_VISIBLE_DEVICES=5 python qlora_eval.py \
+CUDA_VISIBLE_DEVICES=7 python qlora_eval.py \
     --model_name_or_path huggyllama/llama-7b \
     --output_dir ./output/guanaco-7b \
     --logging_steps 10 \
@@ -10,7 +10,7 @@ CUDA_VISIBLE_DEVICES=5 python qlora_eval.py \
     --save_total_limit 40 \
     --evaluation_strategy steps \
     --eval_dataset_size 1024 \
-    --max_eval_samples 1000 \
+    --max_eval_samples 10 \
     --per_device_eval_batch_size 1 \
     --max_new_tokens 32 \
     --dataloader_num_workers 3 \
@@ -37,7 +37,7 @@ CUDA_VISIBLE_DEVICES=5 python qlora_eval.py \
     --gradient_accumulation_steps 16 \
     --max_steps 3750 \
     --report_to wandb \
-    --eval_steps 200 \
+    --eval_steps 5 \
     --learning_rate 0.0002 \
     --adam_beta2 0.999 \
     --max_grad_norm 0.3 \
