@@ -775,19 +775,17 @@ def train():
                 linear_layers = []
                 while hasattr(base, "model"):
                     base = base.model
-                linear_layer = getattr(base.layers[random_exit_layer-1], f'linear_layer_{random_exit_layer-1}')
                 exit_layers = [8, 16, 24, 32]
 
                 for i in exit_layers:
                     linear_layers.append(getattr(base.layers[i-1], f'linear_layer_{i-1}'))
-                logit = linear_layer(hidden_states[random_exit_layer].to(trainer.model.lm_head.weight.dtype))
 
                 for batch in tqdm(data_loader, total=len(data_loader)):
                     #return loss hidden states, logits, labels
                     (loss, orig_logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False)
                     exit_layers_logits = list()
                     for i, idx in enumerate(exit_layers):
-                        exit_layers_logits.append(torch.nn.functional.softmax(trainer.model.linear_layers[i](hidden_states[idx].to(trainer.model.lm_head.weight.dtype)), dim=-1))
+                        exit_layers_logits.append(torch.nn.functional.softmax(linear_layers[i](hidden_states[idx].to(trainer.model.lm_head.weight.dtype)), dim=-1))
                     
                     # input size: [exit_layer_num, batch_size, seq_len, vocab_dim] logits
                     logits = torch.stack(exit_layers_logits, dim=0)
@@ -828,7 +826,7 @@ def train():
                     random_exit_layer = random.choice(exit_layers)
                     print(f"exiting at: ", random_exit_layer)
                     linear_layer = getattr(base.layers[random_exit_layer-1], f'linear_layer_{random_exit_layer-1}')
-                    final_logits_4 = trainer.model.linear_layer(hidden_states[random_exit_layer].to(trainer.model.lm_head.weight.dtype))
+                    final_logits_4 = linear_layer(hidden_states[random_exit_layer].to(trainer.model.lm_head.weight.dtype))
                     # not passing through softmax because not needed as softmax is monotonic
 
                         # case 5:
@@ -1005,7 +1003,7 @@ def train():
 
                 trainer.log(results)
                 trainer.data_collator.source_max_len = source_max_len
-
+    trainer.add_callback(MMLUEvalCallback)
     # Verifying the datatypes and parameter counts before training.
     print_trainable_parameters(args, model)
     dtypes = {}
