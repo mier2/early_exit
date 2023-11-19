@@ -769,11 +769,16 @@ def train():
                 for batch in tqdm(data_loader, total=len(data_loader)):
                     (loss, logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
                     random_exit_layer = random.choice(exit_layers)
-                    logit = trainer.model.lm_head(hidden_states[random_exit_layer].to(trainer.model.lm_head.weight.dtype))
+                    base = model
+                    while hasattr(base, "model"):
+                        base = base.model
+                    linear_layer = getattr(base.layers[random_exit_layer-1], f'linear_layer_{random_exit_layer-1}')
+
+                    logit = linear_layer(hidden_states[random_exit_layer].to(trainer.model.lm_head.weight.dtype))
                     # There are two tokens, the output, and eos token.
-                    for i, logit in enumerate(logits[0]):
-                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
-                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                    for l in logit:
+                        label_non_zero_id = (batch['labels'][0] != -100).nonzero()[0][0]
+                        logit_abcd = l[label_non_zero_id-1][abcd_idx]
                         preds.append(torch.argmax(logit_abcd).item())
                     
                     labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]

@@ -155,6 +155,7 @@ cython_debug/
 .DS_Store
 
 eval/checkpoint-1000
+eval/wandb
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
