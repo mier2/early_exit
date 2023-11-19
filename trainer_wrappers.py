@@ -248,9 +248,14 @@ class CustomTrainer(Trainer):
             def fn(_, __, output):
                 setattr(model, f"feature_{layer_id.replace('.','_')}", output)
             return fn
+
+        
          #register hooks
         for e in exit_layer:
+            linear_layer = nn.Linear(base.config.hidden_size, base.config.vocab_size, bias=False)
+            linear_layer.weight.data = getattr(model, 'lm_head').weight.data.clone()
             self.base_model.layers[e].register_forward_hook(save_outputs_hook(model, f'{e}'))
+            setattr(self.base_model.layers[e], f'linear_layer_{e}', linear_layer)
         
         iteration_queue = deque()
         current_iteration = 0
@@ -841,7 +846,7 @@ class CustomTrainer(Trainer):
                     
                     for i in range(self.exiting_layer+1 - self.stride_size, self.exiting_layer + 1):     
                         for name, param in self.base_model.named_parameters():
-                            if((name == 'model.norm.weight') or (name == 'lm_head.weight')) and (param.dtype.is_floating_point or param.dtype.is_complex):
+                            if((name == 'linear_layer_{i}')) and (param.dtype.is_floating_point or param.dtype.is_complex):
                                 param.requires_grad_(True)
 
                             if (f'layers.{i}.' in name) and (param.dtype.is_floating_point or param.dtype.is_complex):
@@ -1033,14 +1038,16 @@ class CustomTrainer(Trainer):
         else:
             labels = None
         
+                               
+      
+
+
         chosen_layer = self.exiting_layer
     
         start_index = max(chosen_layer + 1 - self.stride_size, 0)
         end_index = chosen_layer + 1
 
-        # for name, param in model.named_parameters():
-        #     if param.requires_grad == True:
-        #         print(name)
+        
 
         layer_list = [1 if start_index <= i < end_index else 0 for i in range(self.num_layers)]
 
@@ -1058,7 +1065,8 @@ class CustomTrainer(Trainer):
         layer_outputs = getattr(model, f"feature_{chosen_layer}")
         input_tensor = layer_outputs[0].to(model.device)
         input_tensor = input_tensor.to(model.lm_head.weight.dtype)
-        logits = model.lm_head(input_tensor).float()
+        linear_layer = getattr(self.base_model.layers[chosen_layer], f'linear_layer_{chosen_layer}')
+        logits = linear_layer(input_tensor)
         # Shift so that tokens < n predict n
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()

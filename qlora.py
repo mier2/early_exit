@@ -1,5 +1,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+import math
 import random
 from collections import defaultdict
 import copy
@@ -763,47 +764,247 @@ def train():
                 trainer.data_collator.source_max_len = args.mmlu_source_max_len
                 trainer.model.eval()
                 preds, refs = [], []
+                comb_preds1, comb_preds2, comb_preds3, comb_preds4, comb_preds5, comb_preds6 = [], [], [], [], [], []
                 loss_mmlu = 0
                 exit_layers = [8, 16, 24, 32]
+                preds_layer1, preds_layer2, preds_layer3, preds_layer4 = [], [], [], []
+
+                base = model
+                exit_layers_logits = list()
+                
+                linear_layers = []
+                while hasattr(base, "model"):
+                    base = base.model
+                linear_layer = getattr(base.layers[random_exit_layer-1], f'linear_layer_{random_exit_layer-1}')
+                exit_layers = [8, 16, 24, 32]
+
+                for i in exit_layers:
+                    linear_layers.append(getattr(base.layers[i-1], f'linear_layer_{i-1}'))
+                logit = linear_layer(hidden_states[random_exit_layer].to(trainer.model.lm_head.weight.dtype))
 
                 for batch in tqdm(data_loader, total=len(data_loader)):
-                    (loss, logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
-                    random_exit_layer = random.choice(exit_layers)
-                    base = model
-                    while hasattr(base, "model"):
-                        base = base.model
-                    linear_layer = getattr(base.layers[random_exit_layer-1], f'linear_layer_{random_exit_layer-1}')
-
-                    logit = linear_layer(hidden_states[random_exit_layer].to(trainer.model.lm_head.weight.dtype))
-                    # There are two tokens, the output, and eos token.
-                    for l in logit:
-                        label_non_zero_id = (batch['labels'][0] != -100).nonzero()[0][0]
-                        logit_abcd = l[label_non_zero_id-1][abcd_idx]
-                        preds.append(torch.argmax(logit_abcd).item())
+                    #return loss hidden states, logits, labels
+                    (loss, orig_logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False)
+                    exit_layers_logits = list()
+                    for i, idx in enumerate(exit_layers):
+                        exit_layers_logits.append(torch.nn.functional.softmax(trainer.model.linear_layers[i](hidden_states[idx].to(trainer.model.lm_head.weight.dtype)), dim=-1))
                     
+                    # input size: [exit_layer_num, batch_size, seq_len, vocab_dim] logits
+                    logits = torch.stack(exit_layers_logits, dim=0)
+                    # match merge_method:
+                        # case 0:
+                    lambda_const = 1
+                    N = logits.shape[2]
+                    temperature = 4
+                    threshold = [0.9 * lambda_const + 0.1 * math.exp(-temperature * t / N) for t in range(N)]
+                    threshold = torch.tensor(threshold, device=logits.device)[None, ...]
+                    exit_layer = (logits.shape[0]-1)*torch.ones(logits.shape[1:3],device=logits.device)
+                    initial_exit_layer = exit_layer
+                    for layer_num, layer_logit in enumerate(logits):
+                        test_val = torch.topk(layer_logit, k=2, dim=2)[0]
+                        test_val = (test_val[:,:,0] - test_val[:,:,1]).squeeze() 
+                        # if the top is greater than threshold and exit layer is still the last layer, modify to be current layer
+                        mask = (test_val > threshold) & (exit_layer == initial_exit_layer)
+                        exit_layer[mask] = layer_num
+                        #exit_layer[(test_val > threshold) and (exit_layer == initial_exit_layer)] = layer_num
+                    final_logits = torch.zeros((orig_logits[0].shape))    # [batch_size, seq_len, vocab_dim]
+                    for i in range(final_logits.shape[1]):
+                        exit_layer = exit_layer.long()
+                        final_logits[:, i, :] = torch.squeeze(logits[exit_layer[:,i]])[i, :]
+
+                        # case 1:
+                    final_logits_1 = torch.mean(logits, dim=0)
+
+                        # case 2:
+                    weights = [2/((logits.shape[0]+1)*4)*(n+1) for n in range(logits.shape[0])] # normalized weights
+                    weights = torch.tensor(weights, device=logits.device)
+                    final_logits_2 = torch.sum(weights[:, None, None, None] * logits, dim=0)
+
+                        # case 3:
+                    topk = torch.topk(logits, k=1, dim=0)[0].squeeze(dim=0)
+                    final_logits_3 = topk/torch.sum(topk, dim=2)[:,:,None]
+
+                        # case 4:
+                    random_exit_layer = random.choice(exit_layers)
+                    print(f"exiting at: ", random_exit_layer)
+                    linear_layer = getattr(base.layers[random_exit_layer-1], f'linear_layer_{random_exit_layer-1}')
+                    final_logits_4 = trainer.model.linear_layer(hidden_states[random_exit_layer].to(trainer.model.lm_head.weight.dtype))
+                    # not passing through softmax because not needed as softmax is monotonic
+
+                        # case 5:
+                    mask = logits.argmax(dim=3)[:,:,:,None]
+                    one_hot_logits = torch.nn.functional.one_hot(mask).squeeze(dim=3)
+                    one_hot_logits = torch.sum(one_hot_logits, dim=0)
+                    final_logits_5 = one_hot_logits/torch.sum(one_hot_logits, dim=2)[:,:,None]
+
+                        # case 6:
+                    variance = torch.var(logits, dim=3)[:,:,:,None]
+                    final_logits_6 = torch.sum(variance * logits, dim=0)
+        
+                    # output size: [batch_size, seq_len, vocab_dim] final_logits
+                    # logits = logits[0]
+                    exit_layers_preds = list() 
+                    
+                    for logit in exit_layers_logits:
+                        label_non_zero_id = (batch['labels'][0] != -100).nonzero()[0][0]
+                        logit_abcd = logit[0][label_non_zero_id-1][abcd_idx]
+                        exit_layers_preds.append(torch.argmax(logit_abcd).item())
+
+                    preds_layer1.append(exit_layers_preds[0])
+                    preds_layer2.append(exit_layers_preds[1])
+                    preds_layer3.append(exit_layers_preds[2])
+                    preds_layer4.append(exit_layers_preds[3])
+
+
+                    for i, logit in enumerate(final_logits):
+                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        preds.append(torch.argmax(logit_abcd).item())
+                    for i, logit in enumerate(final_logits_1):
+                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        comb_preds1.append(torch.argmax(logit_abcd).item())
+                    for i, logit in enumerate(final_logits_2):
+                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        comb_preds2.append(torch.argmax(logit_abcd).item())
+                    for i, logit in enumerate(final_logits_3):
+                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        comb_preds3.append(torch.argmax(logit_abcd).item())
+                    for i, logit in enumerate(final_logits_4):
+                        label_non_zero_id = (batch['labels'][0] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        comb_preds4.append(torch.argmax(logit_abcd).item())
+                    for i, logit in enumerate(final_logits_5):
+                        label_non_zero_id = (batch['labels'][0] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        comb_preds5.append(torch.argmax(logit_abcd).item())
+                    for i, logit in enumerate(final_logits_6):
+                        label_non_zero_id = (batch['labels'][0] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        comb_preds6.append(torch.argmax(logit_abcd).item())
                     labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
                     refs += [abcd_idx.index(label) for label in labels.tolist()]
                     loss_mmlu += loss.item()
-                # Extract results by subject.
+
+                # print("****************")
+                # print(logits_to_save.shape)
+                # log_history = state.log_history
+                
+                # global_step = state.global_step
+                # torch.save(logits_to_save, f'saved_logits/all_logits_{global_step}.pt')
+
                 results = {'mmlu_loss':loss_mmlu/len(data_loader)}
                 subject = mmlu_dataset['subject']
-                subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
-                for s,p,r in zip(subject, preds, refs):
+                subjects = {s:{'refs':[], 'preds':[], 'preds_layer1': [], 'preds_layer2': [], 'preds_layer3': [], 'preds_layer4': [],\
+                               'preds_comb1': [], "preds_comb2": [], "preds_comb3": [], "preds_comb4": [], "preds_comb5": [], "preds_comb6": []} for s in set(subject)}
+                for s,p,r, pr1, pr2, pr3, pr4, comb1, comb2, comb3, comb4, comb5, comb6 in\
+                    zip(subject, preds, refs, preds_layer1, preds_layer2, preds_layer3, preds_layer4, comb_preds1, comb_preds2, comb_preds3, comb_preds4, comb_preds5, comb_preds6):
                     subjects[s]['preds'].append(p)
                     subjects[s]['refs'].append(r)
+                    subjects[s]['preds_layer1'].append(pr1)
+                    subjects[s]['preds_layer2'].append(pr2)
+                    subjects[s]['preds_layer3'].append(pr3)
+                    subjects[s]['preds_layer4'].append(pr4)
+                    subjects[s]['preds_comb1'].append(comb1)
+                    subjects[s]['preds_comb2'].append(comb2)
+                    subjects[s]['preds_comb3'].append(comb3)
+                    subjects[s]['preds_comb4'].append(comb4)
+                    subjects[s]['preds_comb5'].append(comb5)
+                    subjects[s]['preds_comb6'].append(comb6)
                 subject_scores = []
+                subject_scores_layer1 = []
+                subject_scores_layer2 = []
+                subject_scores_layer3 = []
+                subject_scores_layer4 = []
+                subject_scores_comb1 = []
+                subject_scores_comb2 = []
+                subject_scores_comb3 = []
+                subject_scores_comb4 = []
+                subject_scores_comb5 = []
+                subject_scores_comb6 = []
                 for subject in subjects:
                     subject_score = accuracy.compute(
                         references=subjects[subject]['refs'],
                         predictions=subjects[subject]['preds']
                     )['accuracy']
+                    subject_score_layer1 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_layer1']
+                    )['accuracy']
+                    subject_score_layer2 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_layer2']
+                    )['accuracy']
+                    subject_score_layer3 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_layer3']
+                    )['accuracy']
+                    subject_score_layer4 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_layer4']
+                    )['accuracy']
+                    subject_score_comb1 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_comb1']
+                    )['accuracy']
+                    subject_score_comb2 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_comb2']
+                    )['accuracy']
+                    subject_score_comb3 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_comb3']
+                    )['accuracy']
+                    subject_score_comb4 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_comb4']
+                    )['accuracy']
+                    subject_score_comb5 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_comb5']
+                    )['accuracy']
+                    subject_score_comb6 = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds_comb6']
+                    )['accuracy']
                     results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer1'] = subject_score_layer1
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer2'] = subject_score_layer2
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer3'] = subject_score_layer3
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_exitlayer4'] = subject_score_layer4
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_comb1'] = subject_score_comb1
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_comb2'] = subject_score_comb2
+                    # results[f'mmlu_{args.mmlu_split}_accuracy_{subject}_comb3'] = subject_score_comb3
                     subject_scores.append(subject_score)
+                    subject_scores_layer1.append(subject_score_layer1)
+                    subject_scores_layer2.append(subject_score_layer2)
+                    subject_scores_layer3.append(subject_score_layer3)
+                    subject_scores_layer4.append(subject_score_layer4)
+                    subject_scores_comb1.append(subject_score_comb1)
+                    subject_scores_comb2.append(subject_score_comb2)
+                    subject_scores_comb3.append(subject_score_comb3)
+                    subject_scores_comb4.append(subject_score_comb4)
+                    subject_scores_comb5.append(subject_score_comb5)
+                    subject_scores_comb6.append(subject_score_comb6)
                 results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
+                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer1'] = np.mean(subject_scores_layer1)
+                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer2'] = np.mean(subject_scores_layer2)
+                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer3'] = np.mean(subject_scores_layer3)
+                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer4'] = np.mean(subject_scores_layer4)
+                results[f'mmlu_{args.mmlu_split}_accuracy_comb1'] = np.mean(subject_scores_comb1)
+                results[f'mmlu_{args.mmlu_split}_accuracy_comb2'] = np.mean(subject_scores_comb2)
+                results[f'mmlu_{args.mmlu_split}_accuracy_comb3'] = np.mean(subject_scores_comb3)
+                results[f'mmlu_{args.mmlu_split}_accuracy_comb4'] = np.mean(subject_scores_comb4)
+                results[f'mmlu_{args.mmlu_split}_accuracy_comb5'] = np.mean(subject_scores_comb5)
+                results[f'mmlu_{args.mmlu_split}_accuracy_comb6'] = np.mean(subject_scores_comb6)
+                print(f"{np.mean(subject_scores_layer1)}, {np.mean(subject_scores_layer2)}, {np.mean(subject_scores_layer3)}, {np.mean(subject_scores_layer4)},\
+                      {np.mean(subject_scores_comb1)}, {np.mean(subject_scores_comb2)}, {np.mean(subject_scores_comb3)}, {np.mean(subject_scores_comb4)}, \
+                      {np.mean(subject_scores_comb5)}, {np.mean(subject_scores_comb6)}")
+
                 trainer.log(results)
                 trainer.data_collator.source_max_len = source_max_len
-
-        trainer.add_callback(MMLUEvalCallback)
 
     # Verifying the datatypes and parameter counts before training.
     print_trainable_parameters(args, model)
